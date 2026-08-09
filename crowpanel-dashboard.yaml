@@ -1,0 +1,607 @@
+substitutions:
+  name: "crowpanel-ha-dashboard"
+  friendly_name: "CrowPanel HA Dashboard"
+  screensaver_idle_minutes: "5"
+
+  # ---- Page 1: Weather - point these at your own weather/climate sensors ----
+  outside_temp_entity: "sensor.outside_temperature"
+  precip_entity: "sensor.outside_precipitation_intensity"
+  indoor_temp_1_entity: "sensor.office_temperature"
+  indoor_temp_2_entity: "sensor.bedroom_temperature"
+
+  # ---- Page 2: Device status - example mixing sensors + switch status ----
+  # (built against a solar charge controller + MPPT controller; swap in
+  # whatever device you're monitoring - any sensor/switch pair works)
+  device_metric_1_entity: "sensor.battery_capacity_remaining"
+  device_metric_2_entity: "sensor.battery_current"
+  device_metric_3_entity: "sensor.battery_power"
+  device_switch_1_entity: "switch.battery_charging"
+  device_switch_2_entity: "switch.battery_discharging"
+  device_metric_4_entity: "sensor.solar_pv_power"
+  device_switch_3_entity: "switch.solar_load"
+
+  # ---- Page 3: Any two percentage sensors + two timestamp sensors ----
+  # (built against the "Claude Usage" HACS integration; works for any
+  # similar pair of %-based sensors with paired reset-time sensors)
+  metric_1_entity: "sensor.claude_usage_session_usage"
+  metric_2_entity: "sensor.claude_usage_week_usage"
+  reset_1_entity: "sensor.claude_usage_session_reset_time"
+  reset_2_entity: "sensor.claude_usage_weekly_reset_time"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Time synced from HA, no explicit timezone - picks up whatever timezone
+# HA itself is configured with (Settings -> System -> General).
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time:
+      - seconds: 0
+        then:
+          - lvgl.label.update:
+              id: lbl_clock_weather
+              text: !lambda 'return id(ha_time).now().strftime("%a %m/%d  %I:%M %p");'
+          - lvgl.label.update:
+              id: lbl_clock_device
+              text: !lambda 'return id(ha_time).now().strftime("%a %m/%d  %I:%M %p");'
+          - lvgl.label.update:
+              id: lbl_clock_custom
+              text: !lambda 'return id(ha_time).now().strftime("%a %m/%d  %I:%M %p");'
+
+globals:
+  - id: last_touch_epoch
+    type: int
+    initial_value: '0'
+
+# Screen dims after idle - any touch wakes it back up (the touch digitizer
+# stays powered even with the backlight off, so taps still register).
+interval:
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              auto t = id(ha_time).now();
+              if (!t.is_valid()) return false;
+              if (id(last_touch_epoch) == 0) {
+                id(last_touch_epoch) = t.timestamp;
+                return false;
+              }
+              return (t.timestamp - id(last_touch_epoch)) > (${screensaver_idle_minutes} * 60);
+          then:
+            - light.turn_off: display_backlight
+
+# Real pins from Elecrow's own factory_sourcecode/HMI2-8/LovyanGFX_Driver.h
+# for this exact board (CrowPanel Advance 2.8" HMI, ESP32-S3, 320x240).
+# Two other sources (a community ESPHome repo and Elecrow's own wiki page)
+# both had wrong/conflicting pins - this is the verified factory config.
+# See README.md for the full story if you're porting to a different size.
+spi:
+  id: spi_bus
+  clk_pin: GPIO42
+  mosi_pin: GPIO39
+  # no MISO - panel is write-only (cfg.pin_miso = -1 in factory source)
+
+i2c:
+  sda: GPIO15
+  scl: GPIO16
+  frequency: 400kHz
+
+# --- Backlight Control ---
+output:
+  - platform: ledc
+    pin: GPIO38
+    id: backlight_output
+
+light:
+  - platform: monochromatic
+    output: backlight_output
+    name: "Display Backlight"
+    id: display_backlight
+    restore_mode: ALWAYS_ON
+
+# --- ST7789 Display (mipi_spi driver; ili9xxx/st7789v are both deprecated) ---
+display:
+  - platform: mipi_spi
+    model: ST7789V
+    spi_id: spi_bus
+    cs_pin: GPIO40
+    dc_pin: GPIO41
+    # no reset_pin - cfg.pin_rst = -1 in factory source, not wired
+    dimensions:
+      width: 320
+      height: 240
+      offset_height: 0
+      offset_width: 0
+    transform:
+      swap_xy: true
+      mirror_x: true
+      mirror_y: false
+    invert_colors: true
+    color_order: BGR
+    data_rate: 40MHz
+    id: crowpanel_display
+
+# --- Capacitive Touch (FT6336, I2C) ---
+# Chip reports vendor ID 0x0 on the ft5x06 platform's register (0xA8),
+# which that driver hard-fails on. ft63x6 reads a different ID register
+# (0xA3) and doesn't hard-fail even if it comes back 0 - same underlying
+# FT5x06-family chip, just a more tolerant driver for this ID quirk.
+# Calibration is explicit (240x320) rather than auto-detected, because
+# auto-detect used the display's ROTATED logical size (320x240) while the
+# touch sensor itself reports in the panel's native pre-rotation portrait
+# orientation (240x320). mirror_y is flipped relative to the display -
+# confirmed empirically (taps landed top<->bottom inverted from the
+# display's own orientation, even with the same swap_xy/mirror_x).
+touchscreen:
+  - platform: ft63x6
+    id: crowpanel_touch
+    address: 0x38
+    interrupt_pin: GPIO47
+    calibration:
+      x_min: 0
+      x_max: 240
+      y_min: 0
+      y_max: 320
+    transform:
+      swap_xy: true
+      mirror_x: true
+      mirror_y: true
+    on_touch:
+      - globals.set:
+          id: last_touch_epoch
+          value: !lambda 'return id(ha_time).now().timestamp;'
+      - light.turn_on: display_backlight
+
+# ============================================================
+# Home Assistant entities
+# ============================================================
+
+sensor:
+  # --- Page 1: Weather ---
+  - platform: homeassistant
+    id: ha_outside_temp
+    entity_id: ${outside_temp_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_outside_temp
+            text: !lambda 'return str_sprintf("Outside Temp: %.0f°F", x);'
+  - platform: homeassistant
+    id: ha_precip
+    entity_id: ${precip_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_precip
+            text: !lambda 'return str_sprintf("Precip Intensity: %.2f in/h", x);'
+  - platform: homeassistant
+    id: ha_indoor_temp_1
+    entity_id: ${indoor_temp_1_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_indoor_temp_1
+            text: !lambda 'return str_sprintf("Office Temp: %.1f°F", x);'
+  - platform: homeassistant
+    id: ha_indoor_temp_2
+    entity_id: ${indoor_temp_2_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_indoor_temp_2
+            text: !lambda 'return str_sprintf("Bedroom Temp: %.1f°F", x);'
+
+  # --- Page 2: Device status ---
+  - platform: homeassistant
+    id: ha_device_metric_1
+    entity_id: ${device_metric_1_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_device_metric_1
+            text: !lambda 'return str_sprintf("Capacity Remaining: %.1f Ah", x);'
+  - platform: homeassistant
+    id: ha_device_metric_2
+    entity_id: ${device_metric_2_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_device_metric_2
+            text: !lambda 'return str_sprintf("Current: %.1f A", x);'
+  - platform: homeassistant
+    id: ha_device_metric_3
+    entity_id: ${device_metric_3_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_device_metric_3
+            text: !lambda 'return str_sprintf("Power: %.0f W", x);'
+  - platform: homeassistant
+    id: ha_device_metric_4
+    entity_id: ${device_metric_4_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_device_metric_4
+            text: !lambda 'return str_sprintf("PV Power: %.0f W", x);'
+
+  # --- Page 3: Custom metrics ---
+  - platform: homeassistant
+    id: ha_metric_1
+    entity_id: ${metric_1_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_metric_1
+            text: !lambda 'return str_sprintf("Session Usage: %.1f%%", x);'
+  - platform: homeassistant
+    id: ha_metric_2
+    entity_id: ${metric_2_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_metric_2
+            text: !lambda 'return str_sprintf("Week Usage Pace: %.1f%%", x);'
+
+binary_sensor:
+  # These bind directly to switch.* entities - ESPHome's homeassistant
+  # binary_sensor platform treats any "on"/"off" state as a binary sensor,
+  # switches included.
+  - platform: homeassistant
+    id: ha_device_switch_1
+    entity_id: ${device_switch_1_entity}
+    on_state:
+      then:
+        - lvgl.label.update:
+            id: lbl_device_switch_1
+            text: !lambda 'return x ? std::string("Charging: ON") : std::string("Charging: OFF");'
+            text_color: !lambda 'return x ? lv_color_hex(0xFF4433) : lv_color_hex(0x552222);'
+  - platform: homeassistant
+    id: ha_device_switch_2
+    entity_id: ${device_switch_2_entity}
+    on_state:
+      then:
+        - lvgl.label.update:
+            id: lbl_device_switch_2
+            text: !lambda 'return x ? std::string("Discharging: ON") : std::string("Discharging: OFF");'
+            text_color: !lambda 'return x ? lv_color_hex(0xFF4433) : lv_color_hex(0x552222);'
+  - platform: homeassistant
+    id: ha_device_switch_3
+    entity_id: ${device_switch_3_entity}
+    on_state:
+      then:
+        - lvgl.label.update:
+            id: lbl_device_switch_3
+            text: !lambda 'return x ? std::string("Load: ON") : std::string("Load: OFF");'
+            text_color: !lambda 'return x ? lv_color_hex(0xFF4433) : lv_color_hex(0x552222);'
+
+# Timestamp sensors come from HA as UTC ISO-8601 strings (e.g.
+# "2026-08-09T07:09:59+00:00"). Shown here trimmed to "MM-DD HH:MMZ" rather
+# than a relative countdown or local time - no on-device time math/timezone
+# conversion for these specifically, so the "Z" is a reminder they're UTC,
+# not local (the clock row elsewhere on screen IS local, via the time:
+# component above).
+text_sensor:
+  - platform: homeassistant
+    id: ha_reset_1
+    entity_id: ${reset_1_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_reset_1
+            text: !lambda |-
+              std::string s = x;
+              if (s.size() >= 16) {
+                return std::string("Session Reset: ") + s.substr(5, 5) + " " + s.substr(11, 5) + "Z";
+              }
+              return std::string("Session Reset: --");
+  - platform: homeassistant
+    id: ha_reset_2
+    entity_id: ${reset_2_entity}
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_reset_2
+            text: !lambda |-
+              std::string s = x;
+              if (s.size() >= 16) {
+                return std::string("Week Reset: ") + s.substr(5, 5) + " " + s.substr(11, 5) + "Z";
+              }
+              return std::string("Week Reset: --");
+
+# ============================================================
+# LVGL UI - 3 pages, dark red/black theme, clock between the nav buttons
+# ============================================================
+
+lvgl:
+  displays:
+    - crowpanel_display
+  touchscreens:
+    - touchscreen_id: crowpanel_touch
+  color_depth: 16
+  buffer_size: 25%
+
+  pages:
+    - id: page_weather
+      bg_color: 0x0D0000
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 4
+            text: "Weather"
+            text_color: 0xFF3333
+            text_font: montserrat_20
+        - label:
+            id: lbl_outside_temp
+            x: 12
+            y: 40
+            text: "Outside Temp: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_precip
+            x: 12
+            y: 72
+            text: "Precip Intensity: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_indoor_temp_1
+            x: 12
+            y: 104
+            text: "Office Temp: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_indoor_temp_2
+            x: 12
+            y: 136
+            text: "Bedroom Temp: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_clock_weather
+            x: 40
+            y: 210
+            width: 240
+            height: 20
+            text_align: CENTER
+            text: "--"
+            text_color: 0x803030
+            text_font: montserrat_14
+        - button:
+            x: 0
+            y: 200
+            width: 40
+            height: 40
+            bg_color: 0x1A0808
+            border_color: 0xCC2222
+            border_width: 1
+            widgets:
+              - label:
+                  text: "<"
+                  text_color: 0xFF3333
+            on_click:
+              - lvgl.page.previous:
+                  animation: MOVE_RIGHT
+                  time: 200ms
+        - button:
+            x: 280
+            y: 200
+            width: 40
+            height: 40
+            bg_color: 0x1A0808
+            border_color: 0xCC2222
+            border_width: 1
+            widgets:
+              - label:
+                  text: ">"
+                  text_color: 0xFF3333
+            on_click:
+              - lvgl.page.next:
+                  animation: MOVE_LEFT
+                  time: 200ms
+
+    - id: page_device
+      bg_color: 0x0D0000
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 4
+            text: "Device"
+            text_color: 0xFF3333
+            text_font: montserrat_20
+        - label:
+            id: lbl_device_metric_1
+            x: 12
+            y: 28
+            text: "Capacity Remaining: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_device_metric_2
+            x: 12
+            y: 50
+            text: "Current: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_device_metric_3
+            x: 12
+            y: 72
+            text: "Power: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_device_switch_1
+            x: 12
+            y: 94
+            text: "Charging: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_device_switch_2
+            x: 12
+            y: 116
+            text: "Discharging: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_device_metric_4
+            x: 12
+            y: 138
+            text: "PV Power: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_device_switch_3
+            x: 12
+            y: 160
+            text: "Load: --"
+            text_color: 0xE05050
+            text_font: montserrat_14
+        - label:
+            id: lbl_clock_device
+            x: 40
+            y: 210
+            width: 240
+            height: 20
+            text_align: CENTER
+            text: "--"
+            text_color: 0x803030
+            text_font: montserrat_14
+        - button:
+            x: 0
+            y: 200
+            width: 40
+            height: 40
+            bg_color: 0x1A0808
+            border_color: 0xCC2222
+            border_width: 1
+            widgets:
+              - label:
+                  text: "<"
+                  text_color: 0xFF3333
+            on_click:
+              - lvgl.page.previous:
+                  animation: MOVE_RIGHT
+                  time: 200ms
+        - button:
+            x: 280
+            y: 200
+            width: 40
+            height: 40
+            bg_color: 0x1A0808
+            border_color: 0xCC2222
+            border_width: 1
+            widgets:
+              - label:
+                  text: ">"
+                  text_color: 0xFF3333
+            on_click:
+              - lvgl.page.next:
+                  animation: MOVE_LEFT
+                  time: 200ms
+
+    - id: page_custom
+      bg_color: 0x0D0000
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 4
+            text: "Custom"
+            text_color: 0xFF3333
+            text_font: montserrat_20
+        - label:
+            id: lbl_metric_1
+            x: 12
+            y: 40
+            text: "Session Usage: --"
+            text_color: 0xE05050
+            text_font: montserrat_16
+        - label:
+            id: lbl_metric_2
+            x: 12
+            y: 68
+            text: "Week Usage Pace: --"
+            text_color: 0xE05050
+            text_font: montserrat_16
+        - label:
+            id: lbl_reset_1
+            x: 12
+            y: 104
+            text: "Session Reset: --"
+            text_color: 0x803030
+            text_font: montserrat_14
+        - label:
+            id: lbl_reset_2
+            x: 12
+            y: 128
+            text: "Week Reset: --"
+            text_color: 0x803030
+            text_font: montserrat_14
+        - label:
+            id: lbl_clock_custom
+            x: 40
+            y: 210
+            width: 240
+            height: 20
+            text_align: CENTER
+            text: "--"
+            text_color: 0x803030
+            text_font: montserrat_14
+        - button:
+            x: 0
+            y: 200
+            width: 40
+            height: 40
+            bg_color: 0x1A0808
+            border_color: 0xCC2222
+            border_width: 1
+            widgets:
+              - label:
+                  text: "<"
+                  text_color: 0xFF3333
+            on_click:
+              - lvgl.page.previous:
+                  animation: MOVE_RIGHT
+                  time: 200ms
+        - button:
+            x: 280
+            y: 200
+            width: 40
+            height: 40
+            bg_color: 0x1A0808
+            border_color: 0xCC2222
+            border_width: 1
+            widgets:
+              - label:
+                  text: ">"
+                  text_color: 0xFF3333
+            on_click:
+              - lvgl.page.next:
+                  animation: MOVE_LEFT
+                  time: 200ms
